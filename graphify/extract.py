@@ -4192,15 +4192,22 @@ def _extract_parallel(
         )
         return False
     if total_files >= _PROGRESS_INTERVAL:
-        # Report the same denominator the intermediate lines used (uncached files
-        # actually processed this run), not total_files — switching to the full
-        # corpus made the count jump upward at the end (cached hits + files with no
-        # extractor never entered uncached_work), which read as inconsistent (#1693).
         _done = len(uncached_work)
         print(
             f"  AST extraction: {_done}/{_done} uncached files (100%) [{max_workers} workers]",
             flush=True,
         )
+
+    # After the pool drains, reload the stat-index from disk so the main process
+    # picks up entries that subprocess workers wrote via save_cached().
+    # Without this, the main process's _flush_stat_index at exit overwrites the
+    # disk with its own (stale) copy, losing subprocess entries (#17839).
+    try:
+        from .cache import reload_stat_index as _reload_stat_index
+        _reload_stat_index()
+    except Exception:
+        pass
+
     return True
 
 

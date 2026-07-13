@@ -16,6 +16,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
 from graphify.file_slice import (
     FileSlice,
     bisect_slice,
@@ -1933,44 +1938,59 @@ def extract_corpus_parallel(
             print(f"[graphify] incremental cache checkpoint failed: {_exc}", file=sys.stderr)
 
     workers = max(1, min(max_concurrency, total))
+    _use_tqdm = _tqdm is not None and sys.stderr.isatty()
     if workers == 1:
-        # Avoid thread pool overhead for single-worker runs (and keep
-        # callback ordering identical to the pre-refactor sequential path).
-        for idx, chunk in enumerate(chunks):
+        _items = enumerate(chunks)
+        _bar = _tqdm(
+            _items, total=total, unit="chunk",
+            desc="[graphify] semantic", file=sys.stderr,
+            bar_format="{desc}: {n_fmt}/{total_fmt} |{bar}| {elapsed}<{remaining}",
+        ) if _tqdm is not None and sys.stderr.isatty() else None
+        if _bar is not None:
+            _items = _bar
+
+        for idx, chunk in _items:
             _, result, exc = _run_one(idx, chunk)
             if exc is not None:
-                print(f"[graphify] chunk {idx + 1}/{total} failed: {exc}", file=sys.stderr)
+                if _bar is not None:
+                    _bar.write(f"[graphify] chunk {idx + 1}/{total} failed: {exc}")
+                else:
+                    print(f"[graphify] chunk {idx + 1}/{total} failed: {exc}", file=sys.stderr)
                 merged["failed_chunks"] += 1
                 continue
             assert result is not None
             _merge_into(merged, result)
             _checkpoint_chunk(result, chunk)
-            if callable(on_chunk_done):
+            if _bar is None and callable(on_chunk_done):
                 on_chunk_done(idx, total, result)
     else:
-        # Merge in deterministic submission order, NOT completion order. Merging
-        # as chunks finish makes the node/edge ordering in the returned corpus
-        # (and therefore graph.json) depend on which network call happened to
-        # return first — so identical input churned run-to-run (#1632). Collect
-        # results keyed by chunk index and merge in sorted order after the pool
-        # drains; this matches the serial path's order. The progress callback
-        # still fires in completion order so long local runs aren't silent.
         results_by_idx: dict[int, dict] = {}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_run_one, idx, chunk) for idx, chunk in enumerate(chunks)]
-            for future in as_completed(futures):
+            _futures_iter = as_completed(futures)
+            _bar = _tqdm(
+                _futures_iter, total=total, unit="chunk",
+                desc="[graphify] semantic", file=sys.stderr,
+                bar_format="{desc}: {n_fmt}/{total_fmt} |{bar}| {elapsed}<{remaining}",
+            ) if _tqdm is not None and sys.stderr.isatty() else None
+            if _bar is not None:
+                _futures_iter = _bar
+            for future in _futures_iter:
                 idx, result, exc = future.result()
                 if exc is not None:
-                    print(
-                        f"[graphify] chunk {idx + 1}/{total} failed: {exc}",
-                        file=sys.stderr,
-                    )
+                    if _bar is not None:
+                        _bar.write(f"[graphify] chunk {idx + 1}/{total} failed: {exc}")
+                    else:
+                        print(
+                            f"[graphify] chunk {idx + 1}/{total} failed: {exc}",
+                            file=sys.stderr,
+                        )
                     merged["failed_chunks"] += 1
                     continue
                 assert result is not None
                 results_by_idx[idx] = result
                 _checkpoint_chunk(result, chunks[idx])
-                if callable(on_chunk_done):
+                if _bar is None and callable(on_chunk_done):
                     on_chunk_done(idx, total, result)
         for idx in sorted(results_by_idx):
             _merge_into(merged, results_by_idx[idx])

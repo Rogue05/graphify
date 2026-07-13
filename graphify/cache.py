@@ -124,14 +124,29 @@ def _ensure_stat_index(root: Path, cache_root: "Path | None" = None) -> None:
 
 def _flush_stat_index() -> None:
     global _stat_index_dirty, _stat_index_root
-    if not _stat_index_dirty or _stat_index_root is None:
+    if _stat_index_root is None:
+        return
+    if not _stat_index_dirty:
         return
     p = _stat_index_file(_stat_index_root)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        # Merge with existing on-disk entries so entries written by subprocesses
+        # (ProcessPoolExecutor workers) are not lost when the main process
+        # flushes later. Without this, a subprocess writes the full stat-index
+        # for files it extracted, then the main process overwrites it with only
+        # the entries it loaded during phase-1 cache checks — data loss (#17839).
+        if p.exists():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+            merged = {**existing, **_stat_index}
+        else:
+            merged = _stat_index
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix="stat-index.", suffix=".tmp")
         try:
-            os.write(fd, json.dumps(_stat_index, separators=(",", ":")).encode())
+            os.write(fd, json.dumps(merged, separators=(",", ":")).encode())
             os.close(fd)
             os.replace(tmp, p)
         except Exception:
@@ -146,6 +161,28 @@ def _flush_stat_index() -> None:
     except OSError:
         pass
     _stat_index_dirty = False
+
+
+def flush_stat_index() -> None:
+    """Explicitly flush the stat-index to disk (for use between pipeline stages).
+    The atexit handler is a safety net; this gives callers control over when
+    the index is written so it survives a later crash in a downstream phase."""
+    _flush_stat_index()
+
+
+def reload_stat_index() -> None:
+    """Drop the in-memory stat-index and re-read from disk.
+
+    Used after ProcessPoolExecutor workers have finished writing their own
+    stat-index files, so the main process picks up the combined state (#17839).
+    """
+    global _stat_index, _stat_index_root, _stat_index_dirty
+    prev = _stat_index_root
+    _stat_index = {}
+    _stat_index_root = None
+    _stat_index_dirty = False
+    if prev is not None:
+        _ensure_stat_index(prev, cache_root=prev)
 
 
 def _normalize_path(path: Path) -> Path:

@@ -2266,6 +2266,17 @@ def dispatch_command(cmd: str) -> None:
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+
+        # Flush the stat-index to disk immediately after AST extraction.
+        # Without this, a crash or exit during the later (network-bound) LLM
+        # phase can leave the index unwritten — forcing every file to re-hash
+        # on the next run (#17839).
+        try:
+            from graphify.cache import flush_stat_index as _flush_stat_index
+            _flush_stat_index()
+        except Exception:
+            pass
+
         stages.mark("AST extract")
 
         # Semantic extraction on docs/papers/images. Check cache first.
@@ -2327,8 +2338,14 @@ def dispatch_command(cmd: str) -> None:
                         **corpus_kwargs,
                     )
                 except ImportError as exc:
-                    print(f"error: {exc}", file=sys.stderr)
-                    sys.exit(1)
+                    # Missing SDK package is fatal for semantic extraction,
+                    # but we should still write the AST-only graph (#17839).
+                    print(f"[graphify extract] error: {exc}", file=sys.stderr)
+                    print(
+                        "[graphify extract] writing AST-only graph (semantic pass skipped).",
+                        file=sys.stderr,
+                    )
+                    fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
                 except Exception as exc:
                     print(
                         f"[graphify extract] semantic extraction failed: {exc}",
@@ -2336,18 +2353,16 @@ def dispatch_command(cmd: str) -> None:
                     )
                     fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
 
-                # on_chunk_done only fires after a chunk succeeds. If fresh
-                # semantic extraction was requested and no chunks completed,
-                # fail instead of writing an AST-only graph with exit 0.
+                # Report partial failure instead of hard-exiting. Writing the
+                # AST-only graph is better than losing all work (#17839).
                 if uncached_paths and _chunk_stats["succeeded"] == 0:
                     print(
-                        f"[graphify extract] error: all semantic chunks failed "
-                        f"for backend '{backend}' ({len(uncached_paths)} uncached files) - "
-                        f"see per-chunk errors above. If you see 'requires the X package', "
-                        f"run `pip install X` and retry.",
+                        f"[graphify extract] WARNING: all {len(uncached_paths)} semantic "
+                        f"chunk(s) failed for backend '{backend}' — see per-chunk errors "
+                        f"above. The AST-only graph will be written; re-run to retry "
+                        f"semantic extraction.",
                         file=sys.stderr,
                     )
-                    sys.exit(1)
                 try:
                     _save_semantic_cache(
                         fresh.get("nodes", []),
