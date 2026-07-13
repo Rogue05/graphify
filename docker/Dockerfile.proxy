@@ -1,0 +1,90 @@
+# graphify egress proxy — allows builder to reach ONLY the configured LLM provider.
+#
+# Build:  docker build -f docker/Dockerfile.proxy -t graphify-proxy .
+# The compose file builds and runs this automatically.
+
+FROM python:3.12-alpine
+
+# Tiny forward-proxy using only stdlib.  Validates every CONNECT target
+# against the single allowed hostname, drops everything else.
+COPY <<"PYEOF" /proxy.py
+import http.server
+import socket
+import select
+import os
+import sys
+import urllib.parse
+
+ALLOWED_HOST = os.environ.get("ALLOWED_HOST", "").strip()
+ALLOWED_PORT = int(os.environ.get("ALLOWED_PORT", "443"))
+BIND = ("0.0.0.0", int(os.environ.get("PROXY_PORT", "8888")))
+
+if not ALLOWED_HOST:
+    print("FATAL: ALLOWED_HOST not set", file=sys.stderr)
+    sys.exit(1)
+
+def host_matches(target: str) -> bool:
+    host = target.rsplit(":", 1)[0]
+    if host == ALLOWED_HOST:
+        return True
+    if ALLOWED_HOST.startswith("*.") and host.endswith(ALLOWED_HOST[1:]):
+        return True
+    return False
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    timeout = 60
+
+    def do_CONNECT(self):
+        target = self.path  # "host:port"
+        if not host_matches(target):
+            self.send_error(403, f"Blocked: {target}")
+            print(f"BLOCK  {target}", file=sys.stderr)
+            return
+        print(f"ALLOW  CONNECT {target}", file=sys.stderr)
+        try:
+            host, port = target.rsplit(":", 1)
+            port = int(port)
+        except ValueError:
+            self.send_error(400, f"Bad target: {target}")
+            return
+        try:
+            remote = socket.create_connection((host, port), timeout=30)
+        except OSError as e:
+            self.send_error(502, f"Cannot connect to {target}: {e}")
+            return
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        self._tunnel(self.connection, remote)
+
+    def do_GET(self):
+        self.send_error(405, "Only CONNECT is supported (HTTPS proxy)")
+
+    def _tunnel(self, client, remote):
+        sockets = [client, remote]
+        while True:
+            r, _, _ = select.select(sockets, [], [], 60)
+            if not r:
+                break
+            for sock in r:
+                data = sock.recv(65536)
+                if not data:
+                    return
+                peer = remote if sock is client else client
+                try:
+                    peer.sendall(data)
+                except OSError:
+                    return
+
+if __name__ == "__main__":
+    print(f"proxy: allowing only {ALLOWED_HOST}:{ALLOWED_PORT} on port {BIND[1]}",
+          file=sys.stderr)
+    server = http.server.ThreadingHTTPServer(BIND, ProxyHandler)
+    server.serve_forever()
+PYEOF
+
+RUN chmod +x /proxy.py \
+    && adduser -D -u 10001 proxy
+
+USER proxy
+
+ENTRYPOINT ["python", "/proxy.py"]

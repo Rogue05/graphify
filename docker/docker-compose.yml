@@ -1,0 +1,134 @@
+# ── graphify two-container setup (OpenAI-compatible backend) ─────
+#
+# Builder:  docker compose --profile build run --rm builder
+# Server:   docker compose up server
+#
+# Copy .env.example to .env, fill in your credentials, then build and run.
+#
+# NETWORK ENFORCEMENT:
+#   Server  — network_mode: none        (hard-blocked at kernel level)
+#   Builder — routed through proxy      (only the configured provider host)
+#
+# The builder is on an internal network with no internet gateway.
+# All HTTPS traffic is forced through a sidecar proxy that validates
+# the CONNECT target against PROXY_ALLOWED_HOST.  Any other destination
+# is rejected with HTTP 403.
+
+services:
+
+  # ── Proxy (egress guard) ───────────────────────────────────────
+  #
+  # Accepts CONNECT tunnels from the builder and forwards them ONLY
+  # to the host:port specified by PROXY_ALLOWED_HOST / PROXY_ALLOWED_PORT.
+  # Lives on both networks: internal (receives from builder) and
+  # egress (reaches the API).  The builder itself has zero internet access.
+  proxy:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.proxy
+    environment:
+      - ALLOWED_HOST=${PROXY_ALLOWED_HOST:?missing PROXY_ALLOWED_HOST}
+      - ALLOWED_PORT=${PROXY_ALLOWED_PORT:-443}
+      - PROXY_PORT=8888
+    networks:
+      - graphify-internal               # accepts builder connections
+      - graphify-egress                 # reaches the real LLM API
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.5"
+
+  # ── Builder ────────────────────────────────────────────────────
+  builder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.builder
+    profiles: ["build"]
+    depends_on:
+      - proxy
+    # ── Volumes ──────────────────────────────────────────────────
+    volumes:
+      # GRAPHIFY_REPO_DIR: absolute path to the project repo (defaults to
+      # the graphify source tree).  Set in .env to point at another project.
+      - ${GRAPHIFY_REPO_DIR:-..}:/repo
+    # ── Environment ──────────────────────────────────────────────
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:?missing OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1-mini}
+      - PYTHONHASHSEED=0
+      - GRAPHIFY_MAX_WORKERS=${GRAPHIFY_MAX_WORKERS:-1}
+      # Route ALL HTTPS through the proxy.  The proxy validates
+      # the CONNECT target and drops anything not matching
+      # PROXY_ALLOWED_HOST.  No direct internet path exists
+      # because the builder is on an internal-only network.
+      - HTTPS_PROXY=http://proxy:8888
+      - HTTP_PROXY=http://proxy:8888
+      # The openai SDK by default verifies TLS certificates against
+      # the real server (not the proxy).  The proxy only tunnels bytes
+      # — the SDK's TLS handshake is end-to-end with the API host.
+      # OPENAI_BASE_URL stays set to the real endpoint.
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    # ── Networks ─────────────────────────────────────────────────
+    networks:
+      - graphify-internal               # only reaches the proxy (no internet)
+    # ── Security ─────────────────────────────────────────────────
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          memory: ${BUILDER_MEMORY:-2G}
+          cpus: "${BUILDER_CPUS:-2.0}"
+    command: extract /repo --backend openai --model ${OPENAI_MODEL:-gpt-4.1-mini}
+
+  # ── Server ─────────────────────────────────────────────────────
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    network_mode: none                  # hard-blocked: no network device
+    volumes:
+      # GRAPHIFY_OUT_DIR: absolute path to graphify-out/ (defaults to
+      # graphify-out/ inside the graphify repo).  Set in .env to point at
+      # another project's graph output.
+      - ${GRAPHIFY_OUT_DIR:-../graphify-out}:/data:ro
+    tmpfs:
+      - /tmp:size=64M,uid=10001,gid=10001,noexec
+    environment:
+      - PYTHONHASHSEED=0
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          memory: ${SERVER_MEMORY:-512M}
+          cpus: "${SERVER_CPUS:-1.0}"
+    ports:
+      - "127.0.0.1:${SERVER_PORT:-8080}:8080"
+    command: >
+      /data/graph.json
+      --transport http
+      --host 0.0.0.0
+      --port 8080
+
+networks:
+  graphify-internal:
+    driver: bridge
+    internal: true                      # no internet — containers can only
+                                        # talk to each other on this network
+  graphify-egress:
+    driver: bridge                      # default bridge — has internet.
+                                        # Only the proxy is attached here.

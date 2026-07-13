@@ -1,0 +1,24 @@
+# graphify MCP server — hardened, read-only, zero outbound network.
+#
+# Build:  docker build -f docker/Dockerfile.server -t graphify-server .
+# Run:    docker run --rm --network none -p 127.0.0.1:8080:8080 \
+#             -v "${PWD}/graphify-out:/data:ro" graphify-server
+
+FROM python:3.12-slim AS server-base
+
+WORKDIR /app
+COPY . /app
+
+RUN pip install --no-cache-dir ".[mcp]"
+
+RUN useradd --create-home --uid 10001 graphify
+USER graphify
+
+# /tmp is a tmpfs at runtime (rootfs is read-only).  Starlette / uvicorn
+# use it for the ASGI lifespan and internal scratch.
+VOLUME /tmp
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "graphify.serve"]
+CMD ["/data/graph.json", "--transport", "http", "--host", "0.0.0.0", "--port", "8080"]
