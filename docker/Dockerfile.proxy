@@ -5,9 +5,10 @@
 
 FROM python:3.12-alpine
 
-# Tiny forward-proxy using only stdlib.  Validates every CONNECT target
-# against the single allowed hostname, drops everything else.
+# Tiny forward-proxy using only stdlib.  Validates CONNECT target and HTTP
+# request URL against the single allowed hostname, drops everything else.
 COPY <<"PYEOF" /proxy.py
+import http.client
 import http.server
 import socket
 import select
@@ -34,6 +35,8 @@ def host_matches(target: str) -> bool:
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     timeout = 60
 
+    # ── CONNECT tunnel (HTTPS proxying) ──────────────────────────
+
     def do_CONNECT(self):
         target = self.path  # "host:port"
         if not host_matches(target):
@@ -56,8 +59,52 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self._tunnel(self.connection, remote)
 
-    def do_GET(self):
-        self.send_error(405, "Only CONNECT is supported (HTTPS proxy)")
+    # ── HTTP proxying (GET / POST / PUT / DELETE / PATCH) ────────
+
+    def _forward_request(self):
+        parsed = urllib.parse.urlparse(self.path)
+        host = parsed.hostname or ""
+        port = parsed.port or 80
+        target = f"{host}:{port}"
+        if not host_matches(target):
+            self.send_error(403, f"Blocked: {target}")
+            print(f"BLOCK  {target}", file=sys.stderr)
+            return
+        print(f"ALLOW  {self.command} {self.path}", file=sys.stderr)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=30)
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ("host", "proxy-connection",
+                                             "proxy-authorization", "proxy-authenticate")}
+            body = None
+            content_len = self.headers.get("Content-Length")
+            if content_len:
+                body = self.rfile.read(int(content_len))
+            conn.request(self.command, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status, resp.reason)
+            for k, v in resp.getheaders():
+                if k.lower() not in ("transfer-encoding",):
+                    self.send_header(k, v)
+            self.end_headers()
+            resp_body = resp.read()
+            self.wfile.write(resp_body)
+            conn.close()
+        except OSError as e:
+            self.send_error(502, f"Upstream error: {e}")
+
+    def do_GET(self):     self._forward_request()
+    def do_POST(self):    self._forward_request()
+    def do_PUT(self):     self._forward_request()
+    def do_DELETE(self):  self._forward_request()
+    def do_PATCH(self):   self._forward_request()
+    def do_HEAD(self):    self._forward_request()
+    def do_OPTIONS(self): self._forward_request()
+
+    # ── tunnel helper ────────────────────────────────────────────
 
     def _tunnel(self, client, remote):
         sockets = [client, remote]

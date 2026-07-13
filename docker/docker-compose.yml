@@ -13,6 +13,18 @@
 # All HTTPS traffic is forced through a sidecar proxy that validates
 # the CONNECT target against PROXY_ALLOWED_HOST.  Any other destination
 # is rejected with HTTP 403.
+# # ── One-time: copy and configure credentials ──
+# copy docker\.env.example docker\.env
+# # Edit docker\.env — set OPENAI_API_KEY and OPENAI_BASE_URL
+
+# # ── Build both images ──
+# docker compose -f docker\docker-compose.yml build
+
+# # ── Run ONLY the builder (extracts graph, then exits) ──
+# docker compose -f docker\docker-compose.yml --profile build run --rm builder
+
+# # ── Run ONLY the server (serves queries, runs until stopped) ──
+# docker compose -f docker\docker-compose.yml up server
 
 services:
 
@@ -30,6 +42,8 @@ services:
       - ALLOWED_HOST=${PROXY_ALLOWED_HOST:?missing PROXY_ALLOWED_HOST}
       - ALLOWED_PORT=${PROXY_ALLOWED_PORT:-443}
       - PROXY_PORT=8888
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - graphify-internal               # accepts builder connections
       - graphify-egress                 # reaches the real LLM API
