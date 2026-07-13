@@ -24,7 +24,7 @@ services:
   # egress (reaches the API).  The builder itself has zero internet access.
   proxy:
     build:
-      context: ..
+      context: .
       dockerfile: docker/Dockerfile.proxy
     environment:
       - ALLOWED_HOST=${PROXY_ALLOWED_HOST:?missing PROXY_ALLOWED_HOST}
@@ -47,7 +47,7 @@ services:
   # ── Builder ────────────────────────────────────────────────────
   builder:
     build:
-      context: ..
+      context: .
       dockerfile: docker/Dockerfile.builder
     profiles: ["build"]
     depends_on:
@@ -94,7 +94,7 @@ services:
   # ── Server ─────────────────────────────────────────────────────
   server:
     build:
-      context: ..
+      context: .
       dockerfile: docker/Dockerfile.server
     network_mode: none                  # hard-blocked: no network device
     volumes:
