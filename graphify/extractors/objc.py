@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 from graphify.extractors.engine import _cpp_declarator_name, _semantic_reference_edge
-from graphify.extractors.resolution import _resolve_c_include_path
+from graphify.extractors.resolution import _per_file_include_dirs, _resolve_c_include_path
 from pathlib import Path
 from typing import Any
 
@@ -160,7 +160,7 @@ def extract_objc(path: Path) -> dict:
                             # that file; the bare-stem id never survives
                             # _disambiguate_colliding_node_ids when a .h/.m pair exists,
                             # so the edge dangled and was dropped (#1475).
-                            resolved = _resolve_c_include_path(raw, str_path)
+                            resolved = _resolve_c_include_path(raw, str_path, _per_file_include_dirs.get(str_path))
                             if resolved is not None:
                                 add_edge(file_nid, _make_id(str(resolved)), "imports", line, context="import")
                             else:

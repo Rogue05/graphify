@@ -773,6 +773,7 @@ def _rebuild_code(
     no_cluster: bool = False,
     acquire_lock: bool = True,
     block_on_lock: bool = False,
+    compile_commands: "dict | None" = None,
 ) -> bool:
     """Re-run AST extraction + build + optional cluster + report for code files. No LLM needed.
 
@@ -1000,7 +1001,14 @@ def _rebuild_code(
             extract_targets = [p for p in code_files if p not in semantic_doc_files]
 
         commit = _git_head()
-        result = extract(extract_targets, cache_root=watch_root) if extract_targets else {
+
+        # Auto-discover compile_commands.json for C/C++ include resolution
+        _cc = compile_commands
+        if _cc is None:
+            from graphify.extractors.compile_db import discover_compile_commands
+            _cc = discover_compile_commands(watch_path)
+
+        result = extract(extract_targets, cache_root=watch_root, compile_commands=_cc) if extract_targets else {
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
         }

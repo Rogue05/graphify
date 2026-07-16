@@ -3871,15 +3871,21 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     ProcessPoolExecutor.
 
     Args:
-        args: (index, path_str, root_str, cache_location_str) tuple. ``root``
-            anchors hash keys / node ids / the XAML boundary; ``cache_location``
-            is where the cache dir is written, decoupled per #1774. A legacy
-            3-tuple (no cache_location) is still accepted for back-compat.
+        args: (index, path_str, root_str, cache_location_str, include_dirs_json)
+            tuple. ``root`` anchors hash keys / node ids / the XAML boundary;
+            ``cache_location`` is where the cache dir is written, decoupled per
+            #1774. A legacy 4-tuple or 3-tuple is still accepted for back-compat.
+            ``include_dirs_json`` (optional 5th element) serializes per-file
+            include directories from compile_commands.json for C/C++ resolution.
 
     Returns:
         (index, result_dict) so results can be placed back in order.
     """
-    if len(args) == 4:
+    import json as _json
+    inc_dirs_json = ""
+    if len(args) >= 5:
+        idx, path_str, root_str, cache_location_str, inc_dirs_json = args
+    elif len(args) == 4:
         idx, path_str, root_str, cache_location_str = args
     else:  # legacy 3-tuple: location == anchor
         idx, path_str, root_str = args
@@ -3887,6 +3893,18 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     path = Path(path_str)
     root = Path(root_str)
     cache_location = Path(cache_location_str)
+
+    if inc_dirs_json:
+        try:
+            raw_map = _json.loads(inc_dirs_json)
+            include_dirs_map = {
+                k: [Path(d) for d in v] for k, v in raw_map.items()
+            }
+            from graphify.extractors.resolution import set_include_dirs_for_extraction
+            set_include_dirs_for_extraction(include_dirs_map)
+        except Exception:
+            pass
+
     _raise_recursion_limit()
     bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
 
@@ -3918,6 +3936,7 @@ def _extract_parallel(
     max_workers: int | None,
     total_files: int,
     cache_location: Path | None = None,
+    include_dirs_map: dict[str, list[Path]] | None = None,
 ) -> bool:
     """Extract uncached files in parallel using ProcessPoolExecutor.
 
@@ -3958,7 +3977,9 @@ def _extract_parallel(
     # the cache dir is written (defaults to root when not decoupled) (#1774).
     root_str = str(root)
     cache_loc_str = str(cache_location if cache_location is not None else root)
-    work_items = [(idx, str(path), root_str, cache_loc_str) for idx, path in uncached_work]
+    import json as _json
+    _inc_dirs_json = _json.dumps({k: [str(d) for d in v] for k, v in include_dirs_map.items()}) if include_dirs_map else ""
+    work_items = [(idx, str(path), root_str, cache_loc_str, _inc_dirs_json) for idx, path in uncached_work]
 
     done_count = 0
     _PROGRESS_INTERVAL = 100
@@ -4028,30 +4049,39 @@ def _extract_sequential(
     root: Path,
     total_files: int,
     cache_location: Path | None = None,
+    include_dirs_map: dict[str, list[Path]] | None = None,
 ) -> None:
     """Extract uncached files sequentially (fallback for small batches)."""
-    _PROGRESS_INTERVAL = 100
-    for work_idx, (idx, path) in enumerate(uncached_work):
-        if (
-            total_files >= _PROGRESS_INTERVAL
-            and work_idx % _PROGRESS_INTERVAL == 0
-            and work_idx > 0
-        ):
-            print(
-                f"  AST extraction: {work_idx}/{len(uncached_work)} uncached files ({work_idx * 100 // len(uncached_work)}%)",
-                flush=True,
-            )
-        extractor = _get_extractor(path)
-        if extractor is None:
-            per_file[idx] = {"nodes": [], "edges": []}
-            continue
-        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
-        # XAML boundary anchors on `root` (the corpus), not the cache location.
-        result = _safe_extract_with_xaml_root(extractor, path, root)
-        # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
-        if not bypass_cache and "error" not in result and result.get("nodes"):
-            save_cached(path, result, root, cache_root=cache_location)
-        per_file[idx] = result
+    if include_dirs_map:
+        from graphify.extractors.resolution import set_include_dirs_for_extraction
+        set_include_dirs_for_extraction(include_dirs_map)
+    try:
+        _PROGRESS_INTERVAL = 100
+        for work_idx, (idx, path) in enumerate(uncached_work):
+            if (
+                total_files >= _PROGRESS_INTERVAL
+                and work_idx % _PROGRESS_INTERVAL == 0
+                and work_idx > 0
+            ):
+                print(
+                    f"  AST extraction: {work_idx}/{len(uncached_work)} uncached files ({work_idx * 100 // len(uncached_work)}%)",
+                    flush=True,
+                )
+            extractor = _get_extractor(path)
+            if extractor is None:
+                per_file[idx] = {"nodes": [], "edges": []}
+                continue
+            bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+            # XAML boundary anchors on `root` (the corpus), not the cache location.
+            result = _safe_extract_with_xaml_root(extractor, path, root)
+            # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
+            if not bypass_cache and "error" not in result and result.get("nodes"):
+                save_cached(path, result, root, cache_root=cache_location)
+            per_file[idx] = result
+    finally:
+        if include_dirs_map:
+            from graphify.extractors.resolution import clear_include_dirs_for_extraction
+            clear_include_dirs_for_extraction()
     if total_files >= _PROGRESS_INTERVAL:
         # Consistent denominator with the intermediate lines (#1693).
         _done = len(uncached_work)
@@ -4067,6 +4097,7 @@ def extract(
     *,
     parallel: bool = True,
     max_workers: int | None = None,
+    compile_commands: "dict[Path, CompileEntry] | None" = None,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -4084,13 +4115,25 @@ def extract(
             use ProcessPoolExecutor for multi-core extraction.
         max_workers: max subprocess count. Defaults to cpu_count (or the
             value of GRAPHIFY_MAX_WORKERS if set), bounded by len(uncached_work).
+        compile_commands: optional dict mapping source file paths to
+            CompileEntry objects from compile_commands.json, providing
+            include directories for C/C++ header resolution.
     """
+    from graphify.extractors.compile_db import CompileEntry  # noqa: F811
+
     paths = [Path(p) for p in paths]
     _check_tree_sitter_version()
     _raise_recursion_limit()
     # Workspace package manifests/globs can change during watch or repeated extraction.
     _WORKSPACE_PACKAGE_CACHE.clear()
     _XAML_CSHARP_CLASS_CACHE.clear()
+
+    include_dirs_map: dict[str, list[Path]] = {}
+    if compile_commands:
+        for p in paths:
+            entry = compile_commands.get(p.resolve())
+            if entry and entry.include_dirs:
+                include_dirs_map[str(p)] = [d for d in entry.include_dirs if d.is_dir()]
 
     # Infer a common root for cache keys (use first diverging segment, not sum of all matches)
     try:
@@ -4143,10 +4186,12 @@ def extract(
         ran_parallel = False
         if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
             ran_parallel = _extract_parallel(
-                uncached_work, per_file, root, max_workers, total, cache_location
+                uncached_work, per_file, root, max_workers, total, cache_location,
+                include_dirs_map=include_dirs_map or None,
             )
         if not ran_parallel:
-            _extract_sequential(uncached_work, per_file, root, total, cache_location)
+            _extract_sequential(uncached_work, per_file, root, total, cache_location,
+                                include_dirs_map=include_dirs_map or None)
 
     # Fill any remaining None slots (shouldn't happen, but defensive)
     for i in range(total):

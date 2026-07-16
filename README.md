@@ -74,6 +74,7 @@ Every tool accepts an optional `project_path` for multi-project graphs. The serv
 Type `/graphify` in your AI coding assistant and it maps your entire project (code, docs, PDFs, images, videos) into a **knowledge graph** you can **query instead of grepping** through files.
 
 - **Code maps for free, fully local.** Code is parsed with tree-sitter AST: deterministic, no LLM, nothing leaves your machine. (Docs, PDFs, images and video use your assistant's model, or a configured API key, for a semantic pass.)
+- **C/C++ include resolution.** `#include` paths are resolved against your build system's include directories via `compile_commands.json` (auto-discovered from CMake/bear builds, or passed explicitly with `--compile-commands`). No more dangling import edges for headers outside the source directory.
 - **Every edge is explained.** Each connection is tagged `EXTRACTED` (explicit in the source) or `INFERRED` (resolved by graphify), so you can tell what was read directly from what was inferred.
 - **Not a vector index.** No embeddings, no vector store: a real graph you traverse. Ask a question, trace the path between two things, or explain one concept.
 

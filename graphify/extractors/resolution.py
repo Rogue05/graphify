@@ -475,17 +475,38 @@ def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | Non
     # external reference — the correct outcome for a third-party import.
     return _make_id("ref", raw), None
 
-def _resolve_c_include_path(raw: str, str_path: str) -> "Path | None":
+_per_file_include_dirs: dict[str, list[Path]] = {}
+
+
+def set_include_dirs_for_extraction(include_dirs_map: dict[str, list[Path]]) -> None:
+    """Set per-file include directories before extraction. Cleared after."""
+    _per_file_include_dirs.clear()
+    _per_file_include_dirs.update(include_dirs_map)
+
+
+def clear_include_dirs_for_extraction() -> None:
+    _per_file_include_dirs.clear()
+
+
+def _resolve_c_include_path(raw: str, str_path: str, include_dirs: "list[Path] | None" = None) -> "Path | None":
     """Resolve a quoted #include path to a real file on disk.
 
-    Searches relative to the including file's directory. Returns None for
-    system headers (<...>) or paths that don't exist on disk.
+    Searches in order:
+      1. The including file's own directory
+      2. Each directory in *include_dirs* (from compile_commands.json)
+
+    Returns None for system headers (<...>) or paths that don't exist on disk.
     """
     if not raw:
         return None
     candidate = (Path(str_path).parent / raw).resolve()
     if candidate.is_file():
         return candidate
+    if include_dirs:
+        for inc in include_dirs:
+            candidate = (inc / raw).resolve()
+            if candidate.is_file():
+                return candidate
     return None
 
 def _resolve_lua_import_target(raw_module: str, str_path: str) -> str:

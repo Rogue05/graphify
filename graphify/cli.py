@@ -1437,16 +1437,30 @@ def dispatch_command(cmd: str) -> None:
         no_cluster = False
         args = sys.argv[2:]
         watch_arg: str | None = None
+        update_compile_commands: str | None = None
+        skip_next = False
         for a in args:
+            if skip_next:
+                skip_next = False
+                continue
             if a == "--force":
                 force = True
                 continue
             if a == "--no-cluster":
                 no_cluster = True
                 continue
+            if a == "--compile-commands":
+                skip_next = True
+                continue
+            if a.startswith("--compile-commands="):
+                update_compile_commands = a.split("=", 1)[1]
+                continue
             if a.startswith("-"):
                 print(f"error: unknown update option: {a}", file=sys.stderr)
                 sys.exit(2)
+            if not a.startswith("-") and skip_next:
+                update_compile_commands = a
+                continue
             if watch_arg is not None:
                 print("error: update accepts at most one path argument", file=sys.stderr)
                 sys.exit(2)
@@ -1466,11 +1480,25 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
         from graphify.watch import _rebuild_code
 
+        # compile_commands.json include resolution for C/C++ projects
+        update_compile_db = None
+        cc_explicit_path: Path | None = None
+        cc_env = os.environ.get("GRAPHIFY_COMPILE_COMMANDS", "")
+        if cc_env == "":
+            pass
+        elif cc_env:
+            cc_explicit_path = Path(cc_env)
+        if update_compile_commands is not None:
+            cc_explicit_path = Path(update_compile_commands)
+        from graphify.extractors.compile_db import discover_compile_commands
+        update_compile_db = discover_compile_commands(watch_path, explicit_path=cc_explicit_path)
+
         print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
         # Interactive CLI: block on the per-repo lock rather than skip, so the
         # user sees their explicit `graphify update` complete instead of
         # exiting silently when a hook-driven rebuild happens to be running.
-        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
+        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True,
+                           compile_commands=update_compile_db)
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (
@@ -2108,7 +2136,8 @@ def dispatch_command(cmd: str) -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--api-timeout S] [--postgres DSN] [--cargo] [--timing]",
+                "[--api-timeout S] [--postgres DSN] [--cargo] [--timing] "
+                "[--compile-commands PATH]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -2144,6 +2173,7 @@ def dispatch_command(cmd: str) -> None:
         cli_resolution: float = 1.0
         cli_exclude_hubs: float | None = None
         cli_excludes: list[str] = []
+        cli_compile_commands: str | None = None
         cli_timing: bool = False
         # --force parity with `graphify update`: the flag or GRAPHIFY_FORCE=1
         # disables the incremental gate and skips semantic-cache reads (#1894).
@@ -2242,6 +2272,10 @@ def dispatch_command(cmd: str) -> None:
                 force = True; i += 1
             elif a == "--timing":
                 cli_timing = True; i += 1
+            elif a == "--compile-commands" and i + 1 < len(args):
+                cli_compile_commands = args[i + 1]; i += 2
+            elif a.startswith("--compile-commands="):
+                cli_compile_commands = a.split("=", 1)[1]; i += 1
             else:
                 i += 1
 
@@ -2530,6 +2564,21 @@ def dispatch_command(cmd: str) -> None:
             ast_kwargs: dict = {"cache_root": out_root}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
+
+            # compile_commands.json include resolution (see docs/compile-commands-design.md)
+            cc_explicit_path: Path | None = None
+            cc_env = os.environ.get("GRAPHIFY_COMPILE_COMMANDS", "")
+            if cc_env == "":
+                pass
+            elif cc_env:
+                cc_explicit_path = Path(cc_env)
+            if cli_compile_commands is not None:
+                cc_explicit_path = Path(cli_compile_commands)
+            from graphify.extractors.compile_db import discover_compile_commands
+            compile_db = discover_compile_commands(target, explicit_path=cc_explicit_path)
+            if compile_db:
+                ast_kwargs["compile_commands"] = compile_db
+
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
             try:
                 ast_result = _ast_extract(code_files, **ast_kwargs)

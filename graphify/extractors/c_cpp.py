@@ -7,17 +7,18 @@ from pathlib import Path
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 from graphify.extractors.engine import _extract_generic, _get_cpp_func_name
 from graphify.extractors.models import LanguageConfig
-from graphify.extractors.resolution import _is_type_like_definition, _resolve_c_include_path
+from graphify.extractors.resolution import _is_type_like_definition, _per_file_include_dirs, _resolve_c_include_path
 
 
 def _import_c(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str, scope_stack: list[str] | None = None) -> None:
+    include_dirs = _per_file_include_dirs.get(str_path)
     for child in node.children:
         if child.type in ("string_literal", "system_lib_string", "string"):
             raw = _read_text(child, source).strip('"<> ')
             # Quoted includes: try to resolve to a real file so the target ID
             # matches the node ID _extract_generic creates for that file.
             if child.type != "system_lib_string":
-                resolved = _resolve_c_include_path(raw, str_path)
+                resolved = _resolve_c_include_path(raw, str_path, include_dirs)
                 if resolved is not None:
                     tgt_nid = _make_id(str(resolved))
                     edges.append({
