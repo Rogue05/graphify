@@ -159,6 +159,27 @@ def test_to_html_contains_visjs():
         assert "vis-network" in content
 
 
+def test_to_html_neighbor_links_have_no_inline_onclick_xss():
+    """#1838: neighbor links dropped an unescaped JSON.stringify(nid) into a
+    quoted inline onclick — which broke every link (the value's own quotes
+    truncated the attribute) and let a node id/label containing a double-quote
+    (from a document or a scraped `graphify add` URL) inject a live event handler
+    into the local report (stored XSS). The template must instead carry the id in
+    an escaped data attribute and dispatch via one delegated listener."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        html = out.read_text()
+    # The vulnerable inline handler is gone entirely...
+    assert 'onclick="focusNode(' not in html
+    assert "JSON.stringify(nid)" not in html
+    # ...replaced by an escaped data attribute + a single delegated listener.
+    assert 'data-nid="${esc(nid)}"' in html
+    assert "closest('.neighbor-link')" in html
+
+
 def test_to_html_pins_visjs_version_with_sri():
     """vis-network script tag must use a pinned versioned URL with a sha384
     Subresource Integrity hash and crossorigin=anonymous. Without this,
@@ -458,6 +479,64 @@ def test_to_obsidian_rerun_updates_own_notes_but_not_user_files():
         to_obsidian(G, communities, str(out), community_labels={0: "Backend2"})
         assert (out / "Database.md").exists()  # graphify re-wrote its own
         assert (out / "UserNote.md").read_text().strip() == "mine"  # user's untouched
+
+
+def _four_node_two_community_graph():
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n1", label="Database", community=0, source_file="app/db.py", type="code")
+    G.add_node("n2", label="Server", community=0, source_file="app/srv.py", type="code")
+    G.add_node("n3", label="Cache", community=1, source_file="infra/cache.py", type="code")
+    G.add_node("n4", label="Queue", community=1, source_file="infra/queue.py", type="code")
+    G.add_edge("n1", "n2")
+    G.add_edge("n3", "n4")
+    return G, {0: ["n1", "n2"], 1: ["n3", "n4"]}
+
+
+def test_to_obsidian_rerun_prunes_removed_nodes():
+    """#1896: re-exporting into the same vault must delete graphify's own notes for
+    nodes (and communities) that dropped out of the graph, so the vault mirrors the
+    current graph rather than old-union-new. User files are never touched."""
+    G4, comm4 = _four_node_two_community_graph()
+    G2, comm2 = _two_node_graph()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "obsidian"
+        to_obsidian(G4, comm4, str(out), community_labels={0: "Backend", 1: "Infra"})
+        assert (out / "Cache.md").exists() and (out / "_COMMUNITY_Infra.md").exists()
+        (out / "MyOwnNote.md").write_text("mine\n", encoding="utf-8")
+        to_obsidian(G2, comm2, str(out), community_labels={0: "Backend"})
+        # notes for removed nodes and the stale community overview are pruned
+        assert not (out / "Cache.md").exists()
+        assert not (out / "Queue.md").exists()
+        assert not (out / "_COMMUNITY_Infra.md").exists()
+        # surviving graphify notes and the user's own note remain
+        assert (out / "Database.md").exists() and (out / "Server.md").exists()
+        assert (out / "_COMMUNITY_Backend.md").exists()
+        assert (out / "MyOwnNote.md").read_text().strip() == "mine"
+
+
+def test_to_obsidian_removed_node_returning_is_writable_again(capsys):
+    """#1896 follow-on: a node that disappears and later returns must be writable
+    again. Before the fix, the manifest was rewritten to only this run's files, so
+    the orphaned note was disowned and the returning node's write was skipped as a
+    'pre-existing user file' forever."""
+    import networkx as nx
+    GA, commA = _two_node_graph()
+    GB = nx.Graph()
+    GB.add_node("n1", label="Database", community=0, source_file="app/db.py", type="code")
+    commB = {0: ["n1"]}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "obsidian"
+        to_obsidian(GA, commA, str(out), community_labels={0: "Backend"})
+        to_obsidian(GB, commB, str(out), community_labels={0: "Backend"})
+        assert not (out / "Server.md").exists()  # pruned while absent
+        capsys.readouterr()
+        to_obsidian(GA, commA, str(out), community_labels={0: "Backend"})
+        # returned node's note exists with current content, written this run
+        assert (out / "Server.md").exists()
+        assert "# Server" in (out / "Server.md").read_text()
+        captured = capsys.readouterr()
+        assert "skipped" not in captured.err.lower()
 
 
 # ── Case-only-distinct labels must not collide on case-insensitive filesystems ──
