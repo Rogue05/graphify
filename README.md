@@ -22,6 +22,55 @@
   <img src="https://img.shields.io/badge/Y%20Combinator-S26-F0652F?style=flat&logo=ycombinator&logoColor=white" alt="YC S26"/>
 </p>
 
+---
+
+## Docker + MCP Server
+
+Run the builder and MCP query server in hardened Docker containers. The builder reaches only your configured LLM provider; the server is air-gapped (`network_mode: none`).
+
+### Quick start
+
+```bash
+# 1. Set credentials
+cp docker/.env.example docker/.env
+# Edit docker/.env — fill in OPENAI_API_KEY, OPENAI_BASE_URL, PROXY_ALLOWED_HOST
+
+# 2. Build
+docker compose -f docker/docker-compose.yml build
+
+# 3. Extract the graph
+docker compose -f docker/docker-compose.yml --profile build run --rm builder
+
+# 4. Serve over MCP (Streamable HTTP on :8080)
+docker compose -f docker/docker-compose.yml up server
+```
+
+### Architecture
+
+| Container | Network | Purpose |
+|-----------|---------|---------|
+| **proxy** | `internal` + `egress` | Egress guard — validates CONNECT target, drops everything else |
+| **builder** | `internal` only (no gateway) | `graphify extract` — forced through proxy, zero direct internet |
+| **server** | `network_mode: none` | Read-only mount of `graphify-out/`, serves 10 MCP tools |
+
+### Wire your MCP client
+
+Clients connect at `http://127.0.0.1:8080/mcp`. Kilo config:
+
+```json
+{ "mcpServers": { "graphify": { "type": "streamableHttp", "url": "http://127.0.0.1:8080/mcp" } } }
+```
+
+For shared access, bind `0.0.0.0` and set `GRAPHIFY_API_KEY` in `.env`. The server validates `Authorization: Bearer <key>` or `X-API-Key: <key>` with constant-time comparison.
+
+### MCP tools
+
+`query_graph` · `get_node` · `get_neighbors` · `get_community` · `god_nodes` · `graph_stats` · `shortest_path` · `list_prs` · `get_pr_impact` · `triage_prs`
+
+Every tool accepts an optional `project_path` for multi-project graphs. The server hot-reloads `graph.json` on mtime change — re-extract without restarting.
+
+---
+
 Type `/graphify` in your AI coding assistant and it maps your entire project (code, docs, PDFs, images, videos) into a **knowledge graph** you can **query instead of grepping** through files.
 
 - **Code maps for free, fully local.** Code is parsed with tree-sitter AST: deterministic, no LLM, nothing leaves your machine. (Docs, PDFs, images and video use your assistant's model, or a configured API key, for a semantic pass.)
