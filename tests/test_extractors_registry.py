@@ -42,3 +42,12 @@ def test_terraform_migrated():
 
     assert facade.extract_terraform is extract_terraform
     assert LANGUAGE_EXTRACTORS["terraform"] is extract_terraform
+
+
+def test_c_migrated():
+    from graphify.extractors.c_cpp import extract_c, extract_cpp
+
+    assert facade.extract_c is extract_c
+    assert facade.extract_cpp is extract_cpp
+    assert LANGUAGE_EXTRACTORS["c"] is extract_c
+    assert LANGUAGE_EXTRACTORS["cpp"] is extract_cpp
