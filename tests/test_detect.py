@@ -738,6 +738,69 @@ def test_detect_skips_graphify_own_cache(tmp_path):
 
 # --- #882: gitignore parent-exclusion rule for ! re-includes ---
 
+def test_anchored_root_wildcard_negation_reincludes_subtree(tmp_path):
+    """`/*` stays at the root, so `!/src/` makes the subtree walkable (#1975)."""
+    for rel in ("src/app/main.py", "src/lib/util.py", "docs/guide.md", "README.md"):
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+    (tmp_path / ".graphifyignore").write_text("/*\n!/src/\n")
+
+    result = detect(tmp_path)
+
+    files = {
+        Path(path).relative_to(tmp_path).as_posix()
+        for paths in result["files"].values()
+        for path in paths
+    }
+    assert files == {"src/app/main.py", "src/lib/util.py"}
+
+
+def test_anchored_negation_cannot_skip_excluded_parent(tmp_path):
+    """Re-including a child cannot rescue it while its parent stays excluded."""
+    victim = tmp_path / "src" / "app" / "main.py"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("x\n")
+    (tmp_path / ".graphifyignore").write_text("/*\n!/src/app/\n")
+
+    assert detect(tmp_path)["total_files"] == 0
+
+
+def test_path_pattern_single_star_does_not_cross_segment(tmp_path):
+    """A regular `*` matches one component; recursive matching requires `**`."""
+    direct = tmp_path / "src" / "main.py"
+    nested = tmp_path / "src" / "app" / "main.py"
+    nested.parent.mkdir(parents=True)
+    direct.write_text("x\n")
+    nested.write_text("x\n")
+    for pattern in ("/src/*.py", "src/*.py"):
+        (tmp_path / ".graphifyignore").write_text(f"{pattern}\n")
+        result = detect(tmp_path)
+        files = [path for paths in result["files"].values() for path in paths]
+        assert not any(path.endswith("src/main.py") for path in files)
+        assert any(path.endswith("src/app/main.py") for path in files)
+
+
+def test_directory_only_negation_does_not_reinclude_file(tmp_path):
+    """A trailing slash restricts a pattern to directories, as in gitignore."""
+    readme = tmp_path / "README.md"
+    readme.write_text("# docs\n")
+    (tmp_path / ".graphifyignore").write_text("/*\n!/README.md/\n")
+
+    assert detect(tmp_path)["total_files"] == 0
+
+
+def test_anchored_double_star_crosses_path_segments(tmp_path):
+    """`**` retains recursive gitignore matching at zero or more depths."""
+    direct = tmp_path / "src" / "generated.py"
+    nested = tmp_path / "src" / "app" / "deep" / "generated.py"
+    nested.parent.mkdir(parents=True)
+    direct.write_text("x\n")
+    nested.write_text("x\n")
+    (tmp_path / ".graphifyignore").write_text("/src/**/generated.py\n")
+
+    assert detect(tmp_path)["total_files"] == 0
+
 def test_negation_cannot_rescue_file_under_excluded_dir(tmp_path):
     """A ! re-include cannot un-ignore a file whose parent dir is excluded (#882)."""
     from graphify.detect import _is_ignored, _load_graphifyignore
@@ -1072,6 +1135,52 @@ def test_sensitive_token_config_yaml():
     assert _is_sensitive(Path("token_config.yaml"))
 
 
+# ── #1943: Stage 1 dir check gets the same source carve-out as Stage 3 ──
+# secrets/ and credentials/ are as often real source packages (Go
+# internal/secrets, a credentials/ service module) as credential stores.
+# Genuine programming-language source beneath them must be graphed; data and
+# config formats — the formats credentials actually ship in — stay dropped,
+# and dedicated credential-store dirs (.ssh, .gnupg, .aws, .gcloud) keep
+# dropping everything with no carve-out.
+
+def test_sensitive_does_not_flag_source_under_secrets_dir():
+    # #1943 exact cases: real source under ambiguous dir names survives.
+    assert not _is_sensitive(Path("internal/secrets/vault.go"))
+    assert not _is_sensitive(Path("app/services/credentials/manager.py"))
+
+def test_sensitive_still_flags_data_under_secrets_dir():
+    # #1943 guard: the carve-out is ONLY for real source — data/config files
+    # under ambiguous dirs remain flagged, whatever their nesting depth.
+    assert _is_sensitive(Path("secrets/db.json"))
+    assert _is_sensitive(Path(".secrets/token.yaml"))
+    assert _is_sensitive(Path("deploy/credentials/prod.env"))
+    assert _is_sensitive(Path("internal/secrets/README.md"))  # docs are not source
+
+def test_sensitive_flags_everything_under_credential_store_dirs():
+    # #1943: dedicated stores get no carve-out — even source-classified files
+    # inside .ssh/.gnupg/.aws/.gcloud stay dropped.
+    assert _is_sensitive(Path("/home/user/.ssh/config"))
+    assert _is_sensitive(Path(".aws/credentials"))
+    assert _is_sensitive(Path(".gnupg/helper.py"))
+    assert _is_sensitive(Path("backup/.gcloud/sync.sh"))
+
+def test_sensitive_dir_carveout_does_not_bypass_name_screens():
+    # #1943: rescued source still falls through to Stages 2-3, so a file whose
+    # NAME is sensitive stays dropped even though its dir carve-out applied.
+    assert _is_sensitive(Path("secrets/service_account.py"))   # Stage 2 pattern
+    assert _is_sensitive(Path("credentials/id_rsa"))           # extensionless key
+
+
+def test_sensitive_dir_carveout_still_drops_tfvars_values_store():
+    # #1943 follow-up: genuine source under secrets/ is rescued, but .tfvars is
+    # Terraform's canonical values store (real secrets), not source — it stays
+    # dropped, while the real code file beside it is kept.
+    assert _is_sensitive(Path("secrets/prod.tfvars"))
+    assert not _is_sensitive(Path("secrets/loader.py"))
+    # .tf / .hcl are genuine infra source and remain graphable under secrets/.
+    assert not _is_sensitive(Path("secrets/main.tf"))
+
+
 # ── Generic keywords must be load-bearing: topic slugs are not secret stores ──
 # A keyword buried mid-phrase in a >=3-word descriptive name is a note ABOUT
 # the topic, not a credential file. It must not be silently dropped.
@@ -1134,6 +1243,42 @@ def test_save_manifest_skips_semantic_hash_for_files_without_cache(tmp_path):
     assert manifest[str(doc1)]["semantic_hash"] != "", "successful file must have semantic_hash"
     assert str(doc2) not in manifest, "failed-chunk file must be absent from manifest"
 
+
+def test_save_manifest_clear_semantic_erases_stale_hash_for_omitted_file(tmp_path):
+    """#1948: a file stamped in an earlier run, then omitted from ``files`` on
+    a later run (LLM dropped its chunk / #1890 retry), must not keep surviving
+    with its stale semantic_hash from the prior run — the seed loop copies
+    the on-disk row verbatim otherwise, and detect_incremental(kind='semantic')
+    reports it unchanged, silently defeating the #1890 retry promise."""
+    import json
+
+    doc = tmp_path / "docs" / "doc.md"
+    doc.parent.mkdir()
+    doc.write_text("# Doc\n\ncontent")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+
+    # Run 1: doc.md is dispatched and stamped.
+    corpus = {str(doc)}
+    save_manifest({"document": [str(doc)]}, manifest_path, root=tmp_path, scan_corpus=corpus)
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    assert manifest["docs/doc.md"]["semantic_hash"] != ""
+
+    # Run 2 (--force re-run): the model omits doc.md this time, so cli.py's
+    # _stamped_manifest_files() drops it from the files dict passed here —
+    # but it was still dispatched, so the caller passes it via clear_semantic.
+    save_manifest(
+        {"document": []}, manifest_path, root=tmp_path,
+        scan_corpus=corpus, clear_semantic={str(doc)},
+    )
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    assert manifest["docs/doc.md"]["semantic_hash"] == "", (
+        "omitted file must have its stale semantic_hash cleared, not inherited"
+    )
+
+    inc = detect_incremental(tmp_path, manifest_path, kind="semantic")
+    assert [Path(f).name for f in inc["new_files"]["document"]] == ["doc.md"], (
+        "cleared file must be re-queued for semantic extraction"
+    )
 
 
 def test_save_manifest_without_filter_unchanged_for_code(tmp_path):

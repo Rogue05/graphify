@@ -1,6 +1,8 @@
 """Tests for `graphify extract` CLI dispatch path in graphify.__main__."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import graphify.__main__ as mainmod
@@ -127,6 +129,132 @@ def test_extract_succeeds_when_at_least_one_chunk_completes(
     assert {
         str(path) for path in cache_call["allowed_source_files"]
     } == {str(corpus / "README.md")}
+
+
+def test_incremental_partial_run_preserves_untouched_semantic_hash(
+    monkeypatch, tmp_path
+):
+    """#1948 caller-side guard: an incremental run that only re-dispatches the
+    CHANGED subset must not blank semantic_hash for live-but-untouched files.
+
+    clear_semantic must be derived from what was actually SENT to the backend
+    this run (semantic_files), not from the full live corpus (files_by_type):
+    with the latter, every unchanged doc lands in the clear set on every
+    incremental run, so the very next run re-extracts the whole corpus,
+    forever."""
+    import json
+
+    corpus = _make_corpus(tmp_path)  # main.go + README.md
+    (corpus / "OTHER.md").write_text("# Other\nAn independent second doc.\n")
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+
+    dispatched: list[list[str]] = []
+
+    def _stamp_everything_sent(paths, **kwargs):
+        sent = sorted(os.path.relpath(str(p), str(corpus)) for p in paths)
+        dispatched.append(sent)
+        on_chunk = kwargs.get("on_chunk_done")
+        if on_chunk:
+            on_chunk(0, 1, {"nodes": [], "edges": [], "hyperedges": []})
+        return {
+            "nodes": [{"id": f"n-{rel}", "source_file": rel,
+                       "file_type": "document"} for rel in sent],
+            "edges": [],
+            "hyperedges": [],
+            "input_tokens": 10,
+            "output_tokens": 5,
+        }
+
+    monkeypatch.setattr(
+        "graphify.llm.extract_corpus_parallel", _stamp_everything_sent
+    )
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+
+    def _run_extract():
+        monkeypatch.setattr(
+            mainmod.sys, "argv",
+            ["graphify", "extract", str(corpus), "--backend", "claude",
+             "--no-cluster", "--out", str(out_dir)],
+        )
+        try:
+            mainmod.main()
+        except SystemExit as exc:
+            assert exc.code in (None, 0), f"unexpected exit code {exc.code}"
+
+    # Run 1: full scan — both docs dispatched and stamped.
+    _run_extract()
+    manifest_path = out_dir / "graphify-out" / "manifest.json"
+    m1 = json.loads(manifest_path.read_text())
+    assert m1["README.md"].get("semantic_hash")
+    assert m1["OTHER.md"].get("semantic_hash")
+
+    # Run 2: only README.md changes → the incremental gate dispatches it alone.
+    (corpus / "README.md").write_text("# Notes\nChanged content, new hash.\n")
+    _run_extract()
+    assert dispatched[-1] == ["README.md"], (
+        f"run 2 should dispatch only the changed doc, got {dispatched[-1]}"
+    )
+    m2 = json.loads(manifest_path.read_text())
+    assert m2["README.md"].get("semantic_hash")
+    # The heart of the guard: an untouched, never-dispatched live doc keeps
+    # its stamp across a partial incremental run.
+    assert m2["OTHER.md"].get("semantic_hash"), (
+        "untouched doc's semantic_hash was blanked by a partial incremental "
+        "run — clear_semantic was derived from the full live corpus instead "
+        "of the dispatched subset (#1948)"
+    )
+
+
+def test_truncated_doc_semantic_hash_is_cleared_for_requeue(monkeypatch, tmp_path):
+    """#1948 x #1950 interaction: a doc stamped complete on a prior run that
+    TRUNCATES (partial) this run must have its stale semantic_hash cleared, so
+    detect_incremental re-queues it — not inherit the old hash and look
+    unchanged. Partial files are dropped by _stamped_manifest_files, so they
+    land in clear_semantic (dispatched-but-not-stamped)."""
+    import json
+
+    corpus = _make_corpus(tmp_path)  # main.go + README.md
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+    partial_run = {"on": False}
+
+    def _extract(paths, **kwargs):
+        rels = sorted(os.path.relpath(str(p), str(corpus)) for p in paths)
+        on_chunk = kwargs.get("on_chunk_done")
+        if on_chunk:
+            on_chunk(0, 1, {"nodes": [], "edges": [], "hyperedges": []})
+        node = {"id": "n-readme", "source_file": "README.md", "file_type": "document"}
+        if partial_run["on"] and "README.md" in rels:
+            node["_partial"] = True  # this run truncated README.md
+        return {"nodes": [node] if "README.md" in rels else [],
+                "edges": [], "hyperedges": [], "input_tokens": 10, "output_tokens": 5}
+
+    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _extract)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+
+    def _run():
+        monkeypatch.setattr(mainmod.sys, "argv",
+                            ["graphify", "extract", str(corpus), "--backend", "claude",
+                             "--no-cluster", "--out", str(out_dir)])
+        try:
+            mainmod.main()
+        except SystemExit as exc:
+            assert exc.code in (None, 0)
+
+    manifest_path = out_dir / "graphify-out" / "manifest.json"
+    _run()  # run 1: complete
+    assert json.loads(manifest_path.read_text())["README.md"].get("semantic_hash")
+
+    # run 2: README.md changes and truncates (partial) this time.
+    (corpus / "README.md").write_text("# Notes\nNew, longer content that truncated.\n")
+    partial_run["on"] = True
+    _run()
+    m2 = json.loads(manifest_path.read_text())
+    assert not m2.get("README.md", {}).get("semantic_hash"), (
+        "a truncated doc's stale semantic_hash must be cleared so it is "
+        "re-queued next run (#1948 x #1950)"
+    )
 
 
 def test_manifest_stamps_freshly_extracted_semantic_docs(monkeypatch, tmp_path):
@@ -354,8 +482,9 @@ def test_extract_mode_deep_dispatches_over_warm_cache(monkeypatch, tmp_path):
     assert len(calls) == 2, (
         "second deep run must be served from cache/semantic-deep/"
     )
-    # The deep entry landed in its own namespace, not cache/semantic/.
-    assert any((corpus / "graphify-out" / "cache" / "semantic-deep").glob("*.json"))
+    # The deep entry landed in its own namespace, not cache/semantic/. Entries are
+    # nested under a p{prompt-fingerprint}/ subdir (#1939), hence the recursive glob.
+    assert any((corpus / "graphify-out" / "cache" / "semantic-deep").glob("**/*.json"))
 
 
 def test_extract_force_flag_redispatches_and_stamps_manifest(monkeypatch, tmp_path):
@@ -387,7 +516,8 @@ def test_extract_force_flag_redispatches_and_stamps_manifest(monkeypatch, tmp_pa
     assert calls[1]["paths"] == [str(corpus / "README.md")]
 
     # The forced run still wrote the semantic cache and stamped the manifest.
-    assert any((corpus / "graphify-out" / "cache" / "semantic").glob("*.json"))
+    # Entries nest under a p{prompt-fingerprint}/ subdir (#1939).
+    assert any((corpus / "graphify-out" / "cache" / "semantic").glob("**/*.json"))
     manifest = json.loads(
         (corpus / "graphify-out" / "manifest.json").read_text()
     )
@@ -653,6 +783,116 @@ def test_extract_timing_flag_emits_stage_timings(monkeypatch, tmp_path, capsys):
     assert "graphify timing" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "postgres_args",
+    [["--postgres", "test-dsn"], ["--postgres=test-dsn"]],
+)
+@pytest.mark.parametrize("cluster_args", [[], ["--no-cluster"]])
+def test_pathless_postgres_extract_initializes_empty_detection(
+    monkeypatch, tmp_path, postgres_args, cluster_args
+):
+    calls = []
+
+    def _introspect(dsn):
+        calls.append(dsn)
+        return {
+            "nodes": [
+                {
+                    "id": "postgresql_users",
+                    "label": "users",
+                    "type": "table",
+                    "file_type": "code",
+                    "source_file": "postgresql:/localhost/test",
+                }
+            ],
+            "edges": [],
+        }
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def app():\n    return 1\n")
+    launcher = tmp_path / "launcher"
+    launcher.mkdir()
+    monkeypatch.chdir(launcher)
+    out_root = tmp_path / "output"
+    graph_path = out_root / "graphify-out" / "graph.json"
+    manifest = out_root / "graphify-out" / "manifest.json"
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr("graphify.pg_introspect.introspect_postgres", _introspect)
+
+    def _run(argv):
+        monkeypatch.setattr(mainmod.sys, "argv", argv)
+        try:
+            mainmod.main()
+        except SystemExit as exc:
+            assert exc.code in (None, 0)
+
+    _run(
+        [
+            "graphify",
+            "extract",
+            str(corpus),
+            "--code-only",
+            "--no-cluster",
+            "--out",
+            str(out_root),
+        ]
+    )
+    assert manifest.exists()
+    assert "app.py" in _node_sources(graph_path)
+    manifest_content = manifest.read_text()
+    (out_root / "graphify-out" / ".graphify_semantic_marker").write_text(
+        '{"output_tokens": 1}'
+    )
+
+    cache_entry = (
+        out_root
+        / "graphify-out"
+        / "cache"
+        / "semantic"
+        / "deadbeef.json"
+    )
+    cache_entry.parent.mkdir(parents=True)
+    cache_entry.write_text('{"nodes": [], "edges": []}')
+    _run(
+        [
+            "graphify",
+            "extract",
+            *postgres_args,
+            *cluster_args,
+            "--out",
+            str(out_root),
+        ]
+    )
+    assert calls == ["test-dsn"]
+    assert cache_entry.exists()
+    assert not manifest.exists()
+    assert "postgresql:/localhost/test" in _node_sources(graph_path)
+    backups = [
+        path
+        for path in (out_root / "graphify-out").iterdir()
+        if path.is_dir() and (path / "manifest.json").exists()
+    ]
+    assert backups
+    assert backups[0].joinpath("manifest.json").read_text() == manifest_content
+
+    _run(
+        [
+            "graphify",
+            "extract",
+            str(corpus),
+            "--code-only",
+            "--no-cluster",
+            "--out",
+            str(out_root),
+        ]
+    )
+    final_sources = _node_sources(graph_path)
+    assert "app.py" in final_sources
+    assert "postgresql:/localhost/test" not in final_sources
+    assert manifest.exists()
+
+
 # ---------------------------------------------------------------------------
 # #1909: a newly-excluded file's nodes must be pruned from graph.json on the
 # next incremental extract even when the manifest never listed the file (the
@@ -818,3 +1058,30 @@ def test_no_cluster_incremental_prunes_newly_excluded_file(
         f"--no-cluster early exit must prune excluded sources, still see {sources}"
     )
     assert any("keep.py" in s for s in sources)
+
+
+def test_cache_check_prompt_file_scopes_hits_to_that_prompt(monkeypatch, tmp_path, capsys):
+    """#1939: cache-check --prompt-file only counts entries produced by that same
+    extraction prompt, so an upgraded prompt reports a miss (re-extract) rather
+    than replaying the older vintage."""
+    from graphify.cache import save_semantic_cache
+
+    doc = tmp_path / "doc.md"
+    doc.write_text("# Doc\n")
+    spec = tmp_path / "extraction-spec.md"
+    spec.write_text("PROMPT V1", encoding="utf-8")
+    save_semantic_cache([{"id": "d", "source_file": "doc.md"}], [],
+                        root=tmp_path, prompt_file=str(spec))
+    files_from = tmp_path / "files.txt"
+    files_from.write_text(str(doc) + "\n")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+
+    base = ["graphify", "cache-check", str(files_from), "--root", str(tmp_path)]
+    _run_extract(monkeypatch, base + ["--prompt-file", str(spec)])
+    assert "Cache: 1 hit, 0 miss" in capsys.readouterr().out
+
+    # An upgrade rewrites the prompt: the entry must no longer satisfy the run.
+    spec.write_text("PROMPT V2 — rewritten by an upgrade", encoding="utf-8")
+    os.utime(spec, ns=(0, 0))
+    _run_extract(monkeypatch, base + ["--prompt-file", str(spec)])
+    assert "Cache: 0 hit, 1 miss" in capsys.readouterr().out

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -319,7 +320,7 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
         resolved = _resolve_js_import_target(raw, str_path)
         if resolved is not None:
             tgt_nid, resolved_path = resolved
-            edges.append({
+            edge = {
                 "source": file_nid,
                 "target": tgt_nid,
                 "relation": "imports_from",
@@ -328,7 +329,15 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
                 "weight": 1.0,
-            })
+            }
+            # Stamp the resolved target file so a same-basename cross-extension
+            # sibling (foo.ts importing/re-exporting ./foo.mjs) keys its target salt
+            # by the TARGET's file rather than the importer's. Both files collapse to
+            # the base id `foo`; without this the salted lookup mis-points the target
+            # back onto the importer's own variant, a phantom self-loop (#1814).
+            if resolved_path is not None:
+                edge["target_file"] = str(resolved_path)
+            edges.append(edge)
 
     # Emit symbol-level edges for named imports/re-exports from local/aliased files.
     # e.g. `import { Foo, type Bar } from './bar'` → file → Foo, file → Bar (EXTRACTED)
@@ -361,6 +370,12 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                                     "source_file": str_path,
                                     "source_location": f"L{line}",
                                     "weight": 1.0,
+                                    # Which file this symbol target was synthesized
+                                    # from, so the id-remap post-pass can repoint a
+                                    # target the candidates rewrite never learns —
+                                    # a barrel defines no symbols (#1983). Transient,
+                                    # stripped at build like the #1814 stamp.
+                                    "target_file": str(resolved_path),
                                 })
         else:
             # Handle: import { Foo, type Bar } from './bar'
@@ -382,6 +397,8 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                                             "source_file": str_path,
                                             "source_location": f"L{line}",
                                             "weight": 1.0,
+                                            # See the re_exports stamp above (#1983).
+                                            "target_file": str(resolved_path),
                                         })
 
 
@@ -4095,6 +4112,7 @@ def extract(
     paths: list[Path],
     cache_root: Path | None = None,
     *,
+    root: Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
     compile_commands: "dict[Path, CompileEntry] | None" = None,
@@ -4108,9 +4126,14 @@ def extract(
 
     Args:
         paths: files to extract from
+        root: explicit anchor for source_file relativization, node ids, and
+            symbol resolution. Pass the SCAN root whenever the cache lives
+            somewhere else (`--out`); without it the anchor falls back to
+            cache_root and every scanned file reads as out-of-root (#1941).
         cache_root: explicit root for graphify-out/cache/ (overrides the
             inferred common path prefix). Pass Path('.') when running on a
             subdirectory so the cache stays at ./graphify-out/cache/.
+            Anchors ids/source_file only as a fallback when `root` is unset.
         parallel: if True and there are >= _PARALLEL_THRESHOLD uncached files,
             use ProcessPoolExecutor for multi-core extraction.
         max_workers: max subprocess count. Defaults to cpu_count (or the
@@ -4122,6 +4145,7 @@ def extract(
     from graphify.extractors.compile_db import CompileEntry  # noqa: F811
 
     paths = [Path(p) for p in paths]
+    anchor_root = Path(root) if root is not None else None
     _check_tree_sitter_version()
     _raise_recursion_limit()
     # Workspace package manifests/globs can change during watch or repeated extraction.
@@ -4152,7 +4176,13 @@ def extract(
             root = Path(*paths[0].parts[:common_len]) if common_len else Path(".")
     except Exception:
         root = Path(".")
-    if cache_root is not None:
+    # An explicit anchor wins. cache_root is only a fallback anchor: it happens to
+    # equal the scan root for the no---out CLI path and for watch, but with --out it
+    # is the OUTPUT dir, and letting it anchor made every scanned file "out-of-root"
+    # -> _portable_out_of_root_sf() -> bare basename for the whole corpus (#1941).
+    if anchor_root is not None:
+        root = anchor_root
+    elif cache_root is not None:
         root = cache_root
     root = root.resolve()
 
@@ -4315,6 +4345,11 @@ def extract(
     # would otherwise orphan (#1529). Stored as a list so the symbol-prefix remap
     # below can try both (identical forms collapse to one — a no-op).
     prefix_remap: dict[Path, list[tuple[str, str]]] = {}
+    # Canonical stem plus every prefix form a file's symbol ids may appear
+    # under, keyed by resolved path — consumed by the target_file-guided
+    # barrel repoint below (#1983). Unlike prefix_remap this records ALL
+    # in-root files, not just those whose prefix changed.
+    stem_forms: dict[Path, tuple[str, list[str]]] = {}
     for path in paths:
         old_id = _make_id(str(path))
         try:
@@ -4342,6 +4377,11 @@ def extract(
             old_prefs.append((old_pref_abs, new_id))
         if old_prefs:
             prefix_remap[path.resolve()] = old_prefs
+        # Absolute form first: it is the longest, so prefix decomposition can
+        # try forms in order without a shorter form shadowing it.
+        stem_forms[path.resolve()] = (
+            new_id, [old_pref_abs, old_pref, new_id]
+        )
     if id_remap:
         for n in all_nodes:
             if n.get("id") in id_remap:
@@ -4353,6 +4393,7 @@ def extract(
                 e["target"] = id_remap[e["target"]]
     if prefix_remap:
         sym_remap: dict[str, str] = {}
+        edge_alias_candidates: dict[str, set[str]] = {}
         for n in all_nodes:
             sf = n.get("source_file")
             if not sf:
@@ -4373,12 +4414,28 @@ def extract(
             # Try both the input-form and absolute-form prefixes for this file
             # (#1529). source_file gating above already prevents cross-file
             # contamination, so the first matching prefix wins.
+            canonical_nid: str | None = None
             for old_pref, new_pref in entry:
                 if nid.startswith(old_pref + "_"):
-                    new_nid = new_pref + nid[len(old_pref):]
-                    if new_nid != nid:
-                        sym_remap[nid] = new_nid
+                    canonical_nid = new_pref + nid[len(old_pref):]
+                    if canonical_nid != nid:
+                        sym_remap[nid] = canonical_nid
                     break
+                if nid.startswith(new_pref + "_"):
+                    canonical_nid = nid
+                    break
+            if canonical_nid is None:
+                continue
+            # Named alias imports/re-exports can retain an absolute-prefixed target
+            # when the symbol node is already canonical. Record every old form
+            # so a redundant import edge or dangling re-export target can be fixed
+            # without globally reinterpreting an id that another real node may own.
+            for old_pref, new_pref in entry:
+                if not canonical_nid.startswith(new_pref + "_"):
+                    continue
+                old_nid = old_pref + canonical_nid[len(new_pref):]
+                if old_nid != canonical_nid:
+                    edge_alias_candidates.setdefault(old_nid, set()).add(canonical_nid)
         if sym_remap:
             for n in all_nodes:
                 if n.get("id") in sym_remap:
@@ -4395,6 +4452,125 @@ def extract(
                 cn = rc.get("caller_nid")
                 if cn in sym_remap:
                     rc["caller_nid"] = sym_remap[cn]
+        if edge_alias_candidates:
+            def _edge_key(edge: dict) -> str:
+                # target_file is a transient stamp (#1814/#1983); exclude it
+                # from twin identity or an alias edge (stamped) never matches
+                # the canonical twin the shared resolver emits (unstamped).
+                return json.dumps(
+                    {k: v for k, v in edge.items() if k != "target_file"},
+                    sort_keys=True, separators=(",", ":"), default=str,
+                )
+            edge_key_counts = Counter(_edge_key(edge) for edge in all_edges)
+            owned_node_ids = {node.get("id") for node in all_nodes}
+            deduped_edges: list[dict] = []
+            for edge in all_edges:
+                if edge.get("relation") == "re_exports":
+                    candidates = edge_alias_candidates.get(edge.get("target", ""), set())
+                    if len(candidates) == 1 and edge.get("target") not in owned_node_ids:
+                        edge["target"] = next(iter(candidates))
+                    deduped_edges.append(edge)
+                    continue
+                candidates = (
+                    edge_alias_candidates.get(edge.get("target", ""), set())
+                    if edge.get("relation") == "imports"
+                    else set()
+                )
+                if len(candidates) == 1:
+                    candidate = next(iter(candidates))
+                    twin_key = _edge_key({**edge, "target": candidate})
+                    # Drop only when the shared resolver emitted the exact
+                    # canonical twin. Otherwise the target may be a legitimate
+                    # owned node id.
+                    if edge_key_counts[twin_key]:
+                        if edge.get("target") in owned_node_ids:
+                            edge_key_counts[twin_key] -= 1
+                        continue
+                deduped_edges.append(edge)
+            all_edges[:] = deduped_edges
+
+    # Repoint symbol-level alias edges that resolve THROUGH a barrel (#1983
+    # follow-up). The candidates rewrite above learns old→canonical forms only
+    # from symbols a file DEFINES; a barrel defines nothing, so a re-export or
+    # named import that resolves to one keeps an absolute-prefixed, dangling
+    # target no rewrite ever learns. Use the target_file stamp to decompose
+    # such a target into (canonical file stem, symbol), follow the barrel's own
+    # already-canonical re_exports edge to the defining symbol — iterating so
+    # multi-hop barrel chains resolve one hop per pass — and, when no chain
+    # leads to a real node, canonicalize the prefix anyway so a checkout path
+    # never survives in an edge target.
+    if stem_forms:
+        owned_ids = {n.get("id") for n in all_nodes}
+
+        def _decompose(target: str, tf: str) -> "tuple[str, str] | None":
+            try:
+                forms = stem_forms.get(Path(tf).resolve())
+            except (OSError, RuntimeError):
+                return None
+            if not forms:
+                return None
+            canonical, prefixes = forms
+            for pref in prefixes:
+                if pref and target.startswith(pref + "_"):
+                    return canonical, target[len(pref) + 1:]
+            return None
+
+        # (canonical file id, symbol) → set of owned targets, learned from
+        # symbol-level re_exports edges that already point at a real node. A set
+        # (not last-write-wins): when a barrel re-exports the SAME local name
+        # from two different modules (`export {x} from './a'; export {x as y}
+        # from './b'` — both key on local name `x`), the key becomes ambiguous
+        # and must NOT be guessed, or we fabricate a wrong edge. Ambiguous keys
+        # resolve to None so the edge falls to the dangling-canonical fallback
+        # (dropped at build), while the shared resolver's correct edge survives.
+        chain: dict[tuple[str, str], set] = {}
+
+        def _resolve1(key) -> "str | None":
+            targets = chain.get(key)
+            return next(iter(targets)) if targets and len(targets) == 1 else None
+
+        def _learn(e: dict) -> None:
+            tf = e.get("target_file")
+            if not tf or e.get("target") not in owned_ids:
+                return
+            dec = _decompose(e.get("target", ""), tf)
+            if dec is not None:
+                chain.setdefault((e.get("source"), dec[1]), set()).add(e["target"])
+
+        for e in all_edges:
+            if e.get("relation") == "re_exports":
+                _learn(e)
+
+        pending = [
+            e for e in all_edges
+            if e.get("relation") in ("re_exports", "imports")
+            and e.get("target_file")
+            and e.get("target") not in owned_ids
+        ]
+        for _ in range(8):  # bounded: each pass resolves one barrel hop
+            progressed = False
+            still: list[dict] = []
+            for e in pending:
+                dec = _decompose(e.get("target", ""), e["target_file"])
+                resolved_target = _resolve1((dec[0], dec[1])) if dec else None
+                if resolved_target is None:
+                    still.append(e)
+                    continue
+                e["target"] = resolved_target
+                if e.get("relation") == "re_exports":
+                    # This barrel's edge now feeds the next hop. Learn it
+                    # directly — decomposing the repointed target against this
+                    # edge's own target_file would fail, since the target now
+                    # carries the DEFINING file's stem, not the barrel's.
+                    chain.setdefault((e.get("source"), dec[1]), set()).add(resolved_target)
+                progressed = True
+            pending = still
+            if not progressed:
+                break
+        for e in pending:
+            dec = _decompose(e.get("target", ""), e["target_file"])
+            if dec is not None:
+                e["target"] = f"{dec[0]}_{dec[1]}"
 
     _merge_swift_extensions(per_file, all_nodes, all_edges)
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
