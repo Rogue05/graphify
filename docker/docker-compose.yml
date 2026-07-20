@@ -110,7 +110,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.server
-    network_mode: none                  # hard-blocked: no network device
+    # network_mode: none removed — port mapping requires a network namespace
+    # The 127.0.0.1 binding in ports: already restricts access to localhost
     volumes:
       # GRAPHIFY_OUT_DIR: absolute path to graphify-out/ (defaults to
       # graphify-out/ inside the graphify repo).  Set in .env to point at
