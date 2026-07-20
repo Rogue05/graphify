@@ -89,6 +89,7 @@ services:
       # — the SDK's TLS handshake is end-to-end with the API host.
       # OPENAI_BASE_URL stays set to the real endpoint.
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - GRAPHIFY_VIZ_NODE_LIMIT=7000
     # ── Networks ─────────────────────────────────────────────────
     networks:
       - graphify-internal               # only reaches the proxy (no internet)
@@ -103,7 +104,18 @@ services:
         limits:
           memory: ${BUILDER_MEMORY:-2G}
           cpus: "${BUILDER_CPUS:-2.0}"
-    command: extract /repo --backend openai --model ${OPENAI_MODEL:-gpt-4.1-mini}
+    # ── Two-step pipeline ────────────────────────────────────────
+    # Step 1: extract  → graph.json + .graphify_analysis.json (AST + semantic)
+    # Step 2: cluster-only → GRAPH_REPORT.md + graph.html (community detection + viz)
+    # Override the image's entrypoint so we can chain both commands.
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      python -m graphify extract /repo --backend openai --model ${OPENAI_MODEL:-gpt-4.1-mini}; rc1=$$?;
+      if [ $$rc1 -ne 0 ]; then
+        echo "[graphify] extract failed (exit $$rc1) — skipping cluster-only" >&2;
+        exit $$rc1;
+      fi;
+      python -m graphify cluster-only /repo
 
   # ── Server ─────────────────────────────────────────────────────
   server:

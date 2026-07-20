@@ -38,19 +38,26 @@ cp docker/.env.example docker/.env
 # 2. Build
 docker compose -f docker/docker-compose.yml build
 
-# 3. Extract the graph
+# 3. Extract the graph + generate report + HTML viz
 docker compose -f docker/docker-compose.yml --profile build run --rm builder
 
 # 4. Serve over MCP (Streamable HTTP on :8080)
 docker compose -f docker/docker-compose.yml up server
 ```
 
+The builder runs a **two-step pipeline**:
+
+1. `extract` — AST + semantic LLM extraction, produces `graph.json` and `.graphify_analysis.json`
+2. `cluster-only` — community detection, produces `GRAPH_REPORT.md` and `graph.html`
+
+All four files land in `graphify-out/`. The HTML is a self-contained force-directed graph you can open in any browser — no server needed.
+
 ### Architecture
 
 | Container | Network | Purpose |
 |-----------|---------|---------|
 | **proxy** | `internal` + `egress` | Egress guard — validates CONNECT target, drops everything else |
-| **builder** | `internal` only (no gateway) | `graphify extract` — forced through proxy, zero direct internet |
+| **builder** | `internal` only (no gateway) | `graphify extract` + `cluster-only` — forced through proxy, zero direct internet |
 | **server** | `network_mode: none` | Read-only mount of `graphify-out/`, serves 10 MCP tools |
 
 ### Wire your MCP client
